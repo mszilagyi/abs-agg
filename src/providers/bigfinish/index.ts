@@ -83,10 +83,12 @@ export default class BigFinishProvider extends BaseProvider {
     const authors = this.namesFrom(releaseData.written_by)
     const rawDetails = releaseData.production_credits?.technical_details
     const technicalDetails = z.record(z.string(), z.unknown()).optional().parse(rawDetails)
-    const duration =
-      technicalDetails?.duration_digital_verified_minutes ||
-      technicalDetails?.duration_physical_verified_minutes ||
+    // Unknown runtimes are given as "N/A"
+    const duration = [
+      technicalDetails?.duration_digital_verified_minutes,
+      technicalDetails?.duration_physical_verified_minutes,
       hit.duration
+    ].find((minutes) => minutes && !Number.isNaN(parseInt(String(minutes), 10)))
     const isbn = technicalDetails?.digital_retail_isbn || technicalDetails?.physical_retail_isbn
     const description = this.resolveRscText(rsc, releaseData.about?.summary) || hit.description || null
 
@@ -231,11 +233,12 @@ export default class BigFinishProvider extends BaseProvider {
       title: data.title,
       bookId: data.url,
       format: 'audiobook',
-      author: data.writtenBy,
-      narrator: data.narratedBy,
-      description: data.about,
-      cover: data.coverUrl,
-      isbn: data.isbn,
+      // Releases without credits, synopsis, cover or ISBN leave those fields null
+      author: data.writtenBy ?? undefined,
+      narrator: data.narratedBy ?? undefined,
+      description: data.about ?? undefined,
+      cover: data.coverUrl ?? undefined,
+      isbn: data.isbn ?? undefined,
       series,
       language: 'en',
       publishedYear,
