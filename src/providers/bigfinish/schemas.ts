@@ -16,6 +16,11 @@ export const bigFinishSearchResultSchema = z.object({
   indexUid: z.string()
 })
 
+// Search results mix indexes such as contributors, whose hits lack the release fields
+export const bigFinishSearchIndexSchema = z.object({
+  hits: z.array(z.looseObject({ indexUid: z.string() }))
+})
+
 export const bigFinishSearchResponseSchema = z.object({
   hits: z.array(bigFinishSearchResultSchema),
   estimatedTotalHits: z.number(),

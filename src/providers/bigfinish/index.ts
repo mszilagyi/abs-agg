@@ -1,13 +1,23 @@
 import { z } from 'zod'
 import type { BookMetadata, ParsedParameters, ProviderConfig } from '../../types'
+import { mapConcurrent } from '../../utils/concurrency'
 import { normalizeBookMetadata } from '../../utils/helpers'
 import { httpClient } from '../../utils/httpClient'
 import { BaseProvider } from '../BaseProvider'
-import { bigFinishReleaseDataSchema, bigFinishSearchResponseSchema } from './schemas'
+import { episodeSeries, matchKey, parseEpisodes, splitNames } from './episodes'
+import type { BigFinishEpisode } from './episodes'
+import {
+  bigFinishReleaseDataSchema,
+  bigFinishSearchIndexSchema,
+  bigFinishSearchResponseSchema,
+  bigFinishSearchResultSchema
+} from './schemas'
 import type { BigFinishReleaseData, BigFinishSearchResult, NamedContributor, ParsedBookData } from './types'
 
 const BASE_URL = 'https://www.bigfinish.com'
 const SEARCH_URL = `${BASE_URL}/api/search`
+// A larger pool keeps the right box set from falling past the limit before its episodes are ranked
+const EPISODE_SEARCH_POOL = 10
 
 const SEARCH_HEADERS = {
   'User-Agent':
@@ -32,9 +42,77 @@ export default class BigFinishProvider extends BaseProvider {
     super(config)
   }
 
-  async searchBooks(title: string, _author: string | null, params: ParsedParameters): Promise<BookMetadata[]> {
+  async searchBooks(title: string, author: string | null, params: ParsedParameters): Promise<BookMetadata[]> {
     const limit = Math.min(Number(params.limit) || 3, 5)
+    // Episodes are derived from the cached box set, so both modes share one detail cache entry
+    const detailParams = Object.fromEntries(Object.entries(params).filter(([key]) => key !== 'episodes'))
 
+    if (params.episodes === 'true') return this.searchEpisodes(title, author, limit, detailParams)
+
+    const searchData = bigFinishSearchResponseSchema.parse(await this.searchRequest(title, limit))
+    const hits = (searchData.hits.filter((hit) => hit.indexUid == 'audiobook_models') ?? []).slice(0, limit)
+
+    const books: BookMetadata[] = []
+
+    for (const hit of hits) {
+      if (!hit.release_slug) continue
+
+      const metadata = await this.fetchRelease(hit, detailParams)
+
+      if (metadata?.title) books.push(metadata)
+    }
+
+    return books
+  }
+
+  // Ranks episodes titled like the query first, then releases titled like it, then the remaining box sets
+  private async searchEpisodes(
+    title: string,
+    author: string | null,
+    limit: number,
+    params: ParsedParameters
+  ): Promise<BookMetadata[]> {
+    const searchData = bigFinishSearchIndexSchema.parse(await this.searchRequest(title, EPISODE_SEARCH_POOL))
+    const hits = searchData.hits
+      .filter((hit) => hit.indexUid === 'audiobook_models')
+      .slice(0, EPISODE_SEARCH_POOL)
+      .map((hit) => bigFinishSearchResultSchema.parse(hit))
+      .filter((hit) => hit.release_slug)
+    const releases = await mapConcurrent(hits, 3, (hit) => this.fetchRelease(hit, params))
+
+    const query = matchKey(title)
+    const authors = new Set(splitNames(author || '').map(matchKey))
+    const byAuthor: BookMetadata[] = []
+    const episodes: BookMetadata[] = []
+    const titledReleases: BookMetadata[] = []
+    const otherReleases: BookMetadata[] = []
+    // Big Finish lists some box sets once per edition; an episode differing only in ID and cover is kept once
+    const seen = new Set<string>()
+
+    for (const [index, release] of releases.entries()) {
+      if (!release?.title) continue
+
+      for (const episode of parseEpisodes(release.description)) {
+        if (matchKey(episode.title) !== query) continue
+
+        const metadata = this.mapEpisode(episode, release, this.productUrl(hits[index]))
+        const key = JSON.stringify({ ...metadata, bookId: undefined, cover: undefined })
+        if (seen.has(key)) continue
+        seen.add(key)
+
+        if (episode.writers.some((writer) => authors.has(matchKey(writer)))) byAuthor.push(metadata)
+        else episodes.push(metadata)
+      }
+
+      const releaseTitles = [release.title, this.extractTitleParts(release.title).title]
+      if (releaseTitles.some((releaseTitle) => matchKey(releaseTitle) === query)) titledReleases.push(release)
+      else otherReleases.push(release)
+    }
+
+    return [...byAuthor, ...episodes, ...titledReleases, ...otherReleases].slice(0, limit)
+  }
+
+  private async searchRequest(title: string, limit: number): Promise<unknown> {
     const query = title.replace(/:/g, ' ')
 
     const searchRes = await httpClient.post(SEARCH_URL, { q: query, limit, offset: 0 }, { headers: SEARCH_HEADERS })
@@ -43,33 +121,52 @@ export default class BigFinishProvider extends BaseProvider {
       throw new Error(`Big Finish search API error: ${searchRes.status}`)
     }
 
-    const searchData = bigFinishSearchResponseSchema.parse(searchRes.data)
-    const hits = (searchData.hits.filter((hit) => hit.indexUid == 'audiobook_models') ?? []).slice(0, limit)
+    return searchRes.data
+  }
 
-    const books: BookMetadata[] = []
+  private productUrl(hit: BigFinishSearchResult): string {
+    return `${BASE_URL}/releases/v/${hit.release_slug}`
+  }
 
-    for (const hit of hits) {
-      if (!hit.release_slug) continue
+  private fetchRelease(hit: BigFinishSearchResult, params: ParsedParameters): Promise<BookMetadata | null> {
+    const productUrl = this.productUrl(hit)
 
-      const productUrl = `${BASE_URL}/releases/v/${hit.release_slug}`
-
-      const metadata = await this.cachedBook(productUrl, params, async () => {
-        const pageRes = await httpClient.get(productUrl, {
-          headers: RSC_HEADERS,
-          responseType: 'text'
-        })
-
-        if (pageRes.status !== 200) throw new Error(`Big Finish details error: ${pageRes.status}`)
-
-        const rsc = String(pageRes.data)
-        const bookData = this.parseProductPage(productUrl, rsc, hit)
-        return bookData ? this.mapToMetadata(bookData) : null
+    return this.cachedBook(productUrl, params, async () => {
+      const pageRes = await httpClient.get(productUrl, {
+        headers: RSC_HEADERS,
+        responseType: 'text'
       })
 
-      if (metadata?.title) books.push(metadata)
-    }
+      if (pageRes.status !== 200) throw new Error(`Big Finish details error: ${pageRes.status}`)
 
-    return books
+      const rsc = String(pageRes.data)
+      const bookData = this.parseProductPage(productUrl, rsc, hit)
+      return bookData ? this.mapToMetadata(bookData) : null
+    })
+  }
+
+  // An episode shares the box set's cover and publication data but not its ISBN or runtime
+  private mapEpisode(episode: BigFinishEpisode, release: BookMetadata, productUrl: string): BookMetadata {
+    const boxSetTitle = release.title
+    const series = episodeSeries(boxSetTitle, release.series?.[0]?.series, episode.number)
+    const from = `<p>From <em>${this.escapeHtml(boxSetTitle)}</em> (${episode.number})</p>`
+    const credited = [...new Set([...episode.writers, ...episode.adapters])]
+    // Uncredited headings borrow the box set's writer only when it has a single one
+    const soleWriter = splitNames(release.author || '').length === 1 ? release.author : undefined
+
+    return normalizeBookMetadata({
+      title: episode.title,
+      bookId: `${productUrl}#${episode.number}`,
+      format: 'audiobook',
+      author: credited.join(', ') || soleWriter,
+      narrator: episode.narrators.join(', ') || release.narrator,
+      description: `${episode.synopsisHtml}${from}`,
+      cover: release.cover,
+      series: series ? [{ series, sequence: episode.number }] : undefined,
+      language: release.language,
+      publishedYear: release.publishedYear,
+      publisher: release.publisher
+    })
   }
 
   private parseProductPage(url: string, rsc: string, hit: BigFinishSearchResult): ParsedBookData | null {

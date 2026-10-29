@@ -19,6 +19,16 @@
       },
       "description": "Maximum number of results to return",
       "default": 3
+    },
+    {
+      "name": "episodes",
+      "required": false,
+      "validation": {
+        "type": "enum",
+        "values": ["true", "false"]
+      },
+      "description": "Return individual episodes of box sets as separate matches",
+      "default": "false"
     }
   ],
   "returnedFields": [

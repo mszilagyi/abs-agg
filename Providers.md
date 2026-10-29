@@ -217,6 +217,7 @@ GET /audioteka/lang:pl/search?title=example&author=author
 | Name | Type | Validation | Default | Description |
 |------|------|------------|---------|-------------|
 | `limit` | int | 1-5 | 3 | Maximum number of results to return |
+| `episodes` | enum | [true, false] | false | Return individual episodes of box sets as separate matches |
 
 ### Returned Fields
 
