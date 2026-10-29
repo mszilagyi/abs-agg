@@ -13,11 +13,12 @@ export interface BigFinishEpisode {
 
 type EpisodeHeading = Omit<BigFinishEpisode, 'synopsisHtml'>
 
-// "2.1 Title", "2.3.2 Title" or "1. Title"
-const HEADING_PATTERN = /^(\d+(?:\.\d+)+|\d{1,2}(?=\.))\.?\s+(.+)$/
+// "2.1 Title", "2.3.2 Title", "1. Title", "Episode 4 Title" or "Part 1: Title"
+const HEADING_PATTERN = /^(?:(?:Episode|Part)\s+(\d{1,2})(?=[\s:])|(\d+(?:\.\d+)+|\d{1,2}(?=\.)))[.:]?\s+(.+)$/
+// Credits use a lowercase "by", which keeps titles such as "By Hook or By Crook" intact
 const CREDIT_SEPARATOR =
-  /(?:,|\s+and)?\s+(adapted|narrated|read|(?:from|based on)\s+(?:an?\s+|the\s+)?(?:original\s+)?(?:story(?:line)?|idea|novel|script|play|serial|outline|treatment|characters?))?\s*by\s+/i
-const CREDIT_GLUE = /^(?:\s|,|&|and|by|adapted|narrated|read)*$/i
+  /(?:,|\s+and)?\s+([Aa]dapted|[Nn]arrated|[Rr]ead|(?:[Ff]rom|[Bb]ased on)\s+(?:an?\s+|the\s+)?(?:original\s+)?(?:story(?:line)?|idea|novel|script|play|serial|outline|treatment|characters?))?\s*by\s+/
+const CREDIT_GLUE = /^(?:\s|[,&'‘’"“”]|and|by|adapted|narrated|read)*$/i
 const CONTRIBUTORS_MARKER = '<!--contributors-->'
 const EPISODE_MARKER = /<!--episode:(\d+)-->/
 const BLOCK_SELECTOR = 'p, ul, ol, li, div, blockquote'
@@ -54,11 +55,12 @@ export function parseHeading(text: string, requireCredits = true): EpisodeHeadin
   const match = HEADING_PATTERN.exec(line)
   if (!match) return null
 
-  const [, number, rest] = match
+  const [, labelled, numbered, rest] = match
+  const number = labelled || numbered
   const [title, ...credits] = rest.replace(/[()]/g, ' ').split(CREDIT_SEPARATOR)
   const heading: EpisodeHeading = {
     number,
-    title: title.replace(/[\s,:;–-]+$/, ''),
+    title: title.replace(/(?:[\s,:;–-]|\s+by)+$/, ''),
     writers: [],
     adapters: [],
     narrators: []
@@ -73,8 +75,8 @@ export function parseHeading(text: string, requireCredits = true): EpisodeHeadin
   }
 
   const credited = heading.writers.length > 0 || heading.adapters.length > 0
-  // Only a dotted number makes an uncredited bold line recognisable as a heading
-  if (!heading.title || (!credited && (requireCredits || !number.includes('.')))) return null
+  // Only a dotted number or an Episode/Part label makes an uncredited bold line recognisable as a heading
+  if (!heading.title || (!credited && (requireCredits || !(labelled || number.includes('.'))))) return null
   return heading
 }
 
@@ -85,9 +87,16 @@ export function splitNames(value: string): string[] {
     .filter(Boolean)
 }
 
-// "'X' and the Daleks" and "X & the Daleks" compare equal
+// "'X' and the Daleks" equals "X & the Daleks", "L.E.G.E.N.D" equals "LEGEND", and "Day of the Master Parts 1-2"
+// equals "Day of the Master"; a single "Part 1" still tells parts apart
 export function matchKey(value: string): string {
-  return normalizeText(value.replace(/['‘’`´]/g, '').replace(/&/g, ' and '))
+  return normalizeText(
+    value
+      .replace(/['‘’`´]/g, '')
+      .replace(/(?<=\b\p{L})\.(?=\p{L}\b)/gu, '')
+      .replace(/\s+Parts?\s+\d+\s*(?:-|–|&|and)\s*\d+\s*$/i, '')
+      .replace(/&/g, ' and ')
+  )
 }
 
 // The series an episode number counts in: the title part numbered like the episode's volume ("Dark Eyes" for 2.1 in
@@ -147,10 +156,10 @@ function markHeadings($: CheerioAPI): EpisodeHeading[] {
 
       let heading: EpisodeHeading | null = null
       let replaced = line.nodes
-      // A lone bold line may be an uncredited heading; anything with glue between bold words needs its credits
-      if (bold[0] && boldLine) heading = parseHeading(text, words.length > 1)
+      // Bold lines may be uncredited; an unbolded line is only a heading when it names its writer
+      if (bold[0] && boldLine) heading = parseHeading(text, false)
       if (bold[0] && !heading) {
-        heading = parseHeading($(words[0]).text())
+        heading = parseHeading($(words[0]).text(), false)
         replaced = [words[0]]
       }
       if (!bold[0] && index === 0 && line.broken) heading = parseHeading(text)
